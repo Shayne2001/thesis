@@ -14,6 +14,90 @@ from typing import Optional
 from einops.layers.torch import Rearrange
 
 
+def _sinusoidal_band_embedding(band_ids: torch.Tensor, embed_dim: int) -> torch.Tensor:
+    """Sinusoidal band embedding (参考可变波段论文中的 channel index encoding 思路).
+
+    Args:
+        band_ids: shape [C], int/float，代表每个 band 的“身份”（默认 0..C-1）。
+        embed_dim: embedding 维度（偶数更合适）。
+
+    Returns:
+        Tensor, shape [C, embed_dim]
+    """
+
+    device = band_ids.device
+    band_ids = band_ids.float().unsqueeze(1)  # [C, 1]
+
+    half_dim = embed_dim // 2
+    div_term = torch.exp(
+        torch.arange(half_dim, device=device, dtype=torch.float32) * (-math.log(10000.0) / max(1, half_dim))
+    )
+    angles = band_ids * div_term.unsqueeze(0)  # [C, half_dim]
+
+    emb = torch.zeros((band_ids.shape[0], embed_dim), device=device, dtype=torch.float32)
+    emb[:, 0::2] = torch.sin(angles)
+    emb[:, 1::2] = torch.cos(angles[:, : emb[:, 1::2].shape[1]])
+    return emb
+
+
+class BandMapper(nn.Module):
+    """把任意 band 数输入映射到固定 base_bands，再映射回原 band 数。
+
+    核心做法：用 band embedding（channel index encoding）+ 可学习 query 做 cross-attention 形式的线性组合。
+    这样内部网络仍可保持固定通道数（base_bands），但模型可接受任意输入 band 数。
+
+    注意：当输入 band 数 == base_bands 时，会自动 bypass，不引入额外开销。
+    """
+
+    def __init__(self, base_bands: int, embed_dim: int = 64):
+        super().__init__()
+        self.base_bands = base_bands
+        self.embed_dim = embed_dim
+        self.query = nn.Parameter(torch.randn(base_bands, embed_dim) * 0.02)
+
+    def _attn_in_to_base(self, band_ids: torch.Tensor) -> torch.Tensor:
+        # [K, C]
+        e = _sinusoidal_band_embedding(band_ids, self.embed_dim)
+        logits = (self.query @ e.t()) / math.sqrt(self.embed_dim)
+        return torch.softmax(logits, dim=-1)
+
+    def _attn_base_to_in(self, band_ids: torch.Tensor) -> torch.Tensor:
+        # [C, K]
+        e = _sinusoidal_band_embedding(band_ids, self.embed_dim)
+        logits = (e @ self.query.t()) / math.sqrt(self.embed_dim)
+        return torch.softmax(logits, dim=-1)
+
+    def to_base(self, x: torch.Tensor, band_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # x: [B, C, H, W] -> [B, K, H, W]
+        b, c, h, w = x.shape
+        if c == self.base_bands:
+            return x
+
+        if band_ids is None:
+            band_ids = torch.arange(c, device=x.device)
+
+        attn = self._attn_in_to_base(band_ids)  # [K, C]
+        x_flat = x.reshape(b, c, -1)  # [B, C, N]
+        y_flat = torch.matmul(attn, x_flat)  # [B, K, N]
+        return y_flat.reshape(b, self.base_bands, h, w)
+
+    def from_base(self, y: torch.Tensor, band_ids: Optional[torch.Tensor] = None, out_bands: Optional[int] = None) -> torch.Tensor:
+        # y: [B, K, H, W] -> [B, C, H, W]
+        b, k, h, w = y.shape
+        if out_bands is None:
+            out_bands = k
+
+        if out_bands == self.base_bands and k == self.base_bands:
+            return y
+
+        if band_ids is None:
+            band_ids = torch.arange(out_bands, device=y.device)
+
+        attn = self._attn_base_to_in(band_ids)  # [C, K]
+        y_flat = y.reshape(b, k, -1)  # [B, K, N]
+        x_flat = torch.matmul(attn, y_flat)  # [B, C, N]
+        return x_flat.reshape(b, out_bands, h, w)
+
 
 class MRDF(nn.Module):
     def __init__(self, nf=64, gc=32, bias=True):
@@ -117,10 +201,8 @@ class AGCA(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.conv1 = nn.Conv2d(in_channel, hide_channel, kernel_size=1, bias=False)
         self.softmax = nn.Softmax(2)
-        # Choose to deploy A0 on GPU or CPU according to your needs
-        # A0是一个固定矩阵，用于保持初始通道关系
-        self.A0 = torch.eye(hide_channel).to('cuda')
-        # self.A0 = torch.eye(hide_channel)
+        # A0 是一个固定矩阵，用于保持初始通道关系；用 buffer 让其随 model.to(device) 自动迁移
+        self.register_buffer("A0", torch.eye(hide_channel), persistent=False)
         # A2 is initialized to 1e-6 通过训练调整通道间关系
         self.A2 = nn.Parameter(torch.FloatTensor(torch.zeros((hide_channel, hide_channel))), requires_grad=True)
         init.constant_(self.A2, 1e-6)
@@ -290,10 +372,12 @@ class SSDecoder(nn.Module):
 
 ##=========full module==========
 class SSANet(nn.Module): 
-    def __init__(self, snr=0, cr=1 , bands=172, bit_num = 8):
+    def __init__(self, snr=0, cr=1 , bands=172, bit_num = 8, variable_bands: bool = True):
         super(SSANet, self).__init__()    ## 初始化DCSN类
         self.snr = snr
         self.bands = bands
+        self.variable_bands = variable_bands
+        self.band_mapper = BandMapper(base_bands=self.bands, embed_dim=64)
         if cr == 1:
             last_stride = 2             ## 这里定义的都是最后一个卷积层的参数 步长为2
             last_ch = int(self.bands//6.25)                ## 通道数为27 满足压缩比为1%
@@ -344,16 +428,25 @@ class SSANet(nn.Module):
         snr = 10**(snr/10.0)  ## 将分贝单位的信噪比转化为线性单位
         xpower = torch.sum(x**2)/x.numel() ## 计算输入信号的平均功率
         npower = torch.sqrt(xpower / snr)  ## 计算噪声的平均功率
-        return x + torch.randn(x.shape).cuda() * npower  ## 生成与 x 形状相同的高斯白噪声，并将其添加到原始信号上
+        return x + torch.randn_like(x) * npower  ## 生成与 x 形状相同的高斯白噪声，并将其添加到原始信号上
 
 
-    def forward(self, data, mode=0): ### Mode=0, default, mode=1: encode only, mode=2: decoded only
+    def forward(self, data, mode=0, band_ids: Optional[torch.Tensor] = None): ### Mode=0, default, mode=1: encode only, mode=2: decoded only
         
+        # 可变波段输入：先映射到 base_bands（self.bands）再进入编码器
+        orig_bands = None
+        if self.variable_bands and mode in (0, 1):
+            orig_bands = data.shape[1]
+            if orig_bands != self.bands:
+                data = self.band_mapper.to_base(data, band_ids=band_ids)
+
         if mode==0:
             x, c_a_l = self.encoder(data)
             if self.snr > 0:
                 x = self.awgn(x, self.snr)
             y = self.decoder(x)
+            if self.variable_bands and orig_bands is not None and orig_bands != self.bands:
+                y = self.band_mapper.from_base(y, band_ids=band_ids, out_bands=orig_bands)
             return y, x, c_a_l
         elif mode==1:
             x, c_a_l = self.encoder(data)
@@ -361,4 +454,4 @@ class SSANet(nn.Module):
         elif mode==2:
             return self.decoder(data)
         else:
-            return self.decoder(self.encoder(data))
+            raise ValueError(f"Unsupported mode: {mode}")

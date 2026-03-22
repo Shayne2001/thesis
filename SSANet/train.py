@@ -25,6 +25,7 @@ from math import acos, degrees
 from tensorboardX import SummaryWriter 
 from trainOps import *
 import yaml
+import argparse
 from thop import profile
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -32,27 +33,62 @@ from thop import profile
 # Hyperparameters
 # torch.cuda.set_device(1)
 
-def load_config(config_path):
+def load_config_optional(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        return {}
     with open(config_path, 'r') as file:
-        config = yaml.safe_load(file)
-    return config
+        return yaml.safe_load(file) or {}
 
-config = load_config('config.yaml')
 
-batch_size = config["batch_size"]
-device = config["device"]
-MAX_EP = config["MAX_EP"]  ## 最大迭代次数
-VAL_HR = config["VAL_HR"]    ## 超分辨率图像的大小
-INTERVAL = config["INTERVAL"]     ## 采样间隔
-WIDTH = config["WIDTH"]         ## 采样宽度
-BANDS = config["BANDS"]     ## 波段数
-SIGMA = config["SIGMA"]     ## Noise free -> SIGMA = 0.0
-                ## Noise mode -> SIGMA > 0.0
-SOURCE = config["SOURCE"] ## 训练集输入图像路径
-TARGET = config["TARGET"] ## 验证集输入图像路径
-CR = config["CR"]         ## CR = 1, 5, 10, 15, 20  CompressionRatio 压缩率大小
-prefix = config["prefix"]
-SNR = config["SNR"]        ## 信噪比
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default='config.yaml')
+
+    # 训练/数据
+    parser.add_argument('--train_list', default='./train_path/train_vis_1.txt')
+    parser.add_argument('--val_list', default='./test_path/val_vis_1.txt')
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--max_ep', type=int, default=10)
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+
+    # strip 采样设置
+    parser.add_argument('--val_hr', type=int, default=256)
+    parser.add_argument('--interval', type=int, default=4)
+    parser.add_argument('--width', type=int, default=4)
+    parser.add_argument('--marginal', type=int, default=60)
+
+    # 模型/任务
+    parser.add_argument('--bands', type=int, default=172)
+    parser.add_argument('--cr', type=int, default=1)
+    parser.add_argument('--snr', type=float, default=0)
+    parser.add_argument('--sigma', type=float, default=0.0)
+    parser.add_argument('--prefix', default='SSANet')
+
+    return parser.parse_args()
+
+
+args = parse_args()
+config = load_config_optional(args.config)
+
+batch_size = int(config.get('batch_size', args.batch_size))
+device = config.get('device', args.device)
+MAX_EP = int(config.get('MAX_EP', args.max_ep))
+VAL_HR = int(config.get('VAL_HR', args.val_hr))
+INTERVAL = int(config.get('INTERVAL', args.interval))
+WIDTH = int(config.get('WIDTH', args.width))
+BANDS = int(config.get('BANDS', args.bands))
+SIGMA = float(config.get('SIGMA', args.sigma))
+SOURCE = config.get('SOURCE', None)
+TARGET = config.get('TARGET', None)
+CR = int(config.get('CR', args.cr))
+prefix = config.get('prefix', args.prefix)
+SNR = float(config.get('SNR', args.snr))
+
+TRAIN_LIST = config.get('train_list', args.train_list)
+VAL_LIST = config.get('val_list', args.val_list)
+NUM_WORKERS = int(config.get('num_workers', args.num_workers))
+MARGINAL = int(config.get('marginal', args.marginal))
 
 
 # def model_metrics(model, input_shape = (172, 128, 4)):
@@ -75,13 +111,24 @@ def trainer():
     ## Reading files #
     
     ## Load test files from specified text with SOURCE/TARGET name (you can replace it with other path u want)
-    flist = loadTxt('./train_path/train_%s.txt' % SOURCE) ## 包含训练集的路径列表
-    valfn = loadTxt('./test_path/val_%s.txt' % TARGET)   ## 包含验证集的路径列表
+    flist = loadTxt(TRAIN_LIST)  ## 包含训练集的路径列表
+    valfn = loadTxt(VAL_LIST)    ## 包含验证集的路径列表
     tlen = len(flist)
 
     ## DataLoader返回一个迭代器，该迭代器将返回一个batch_size大小的数据
-    train_loader = torch.utils.data.DataLoader(dataset_h5(flist, width=4, marginal=60, root=''), batch_size=batch_size, shuffle=True, num_workers=128)
-    val_loader = torch.utils.data.DataLoader(dataset_h5(valfn,mode = 'Validation', root=''), batch_size=5, shuffle=False, pin_memory=False)
+    train_loader = torch.utils.data.DataLoader(
+        dataset_h5(flist, width=WIDTH, marginal=MARGINAL, root='', expected_bands=BANDS),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        dataset_h5(valfn, mode='Validation', root='', expected_bands=BANDS),
+        batch_size=5,
+        shuffle=False,
+        pin_memory=False,
+        num_workers=NUM_WORKERS,
+    )
 
     model = SSANet(snr=0, cr=CR, bands=BANDS)   ## cr =[1, 5, 10, 15, 20] compression ratio
     model = torch.nn.DataParallel(model).to(device) ## GPU并行计算
@@ -129,7 +176,7 @@ def trainer():
             ## x.view改变张量的形状  这里将第一个维度大小和第二个维度合并,其余维度保持不变
             x = x.to(device).permute(0,3,1,2).float() ## 重新排列张量的维度  x.shape = (240, 172, 128, 4)
             # print("x: ", x.shape)
-            decoded, _ = model(x)      ## 执行模型，返回解码后的结果
+            decoded, _, _ = model(x)      ## 执行模型，返回解码后的结果
             # gates = [model.gate1.scores, model.gete2.scores]
             loss = L1Loss(decoded, x)  ## 计算L1Loss
             loss.backward()            ## 反向传播
@@ -151,10 +198,11 @@ def trainer():
                     vx = vx.view(vx.size()[0]*vx.size()[1], vx.size()[2], vx.size()[3], vx.size()[4])
                     ## vx.shape = torch.Size([256, 172, 256, 4])
                     vx= vx.to(device).permute(0,3,1,2).float()
-                    if SIGMA>0:
-                        val_dec = model(awgn(model(vx, mode=1), SNR), mode=2)
+                    if SIGMA > 0:
+                        encoded, _ = model(vx, mode=1)
+                        val_dec = model(awgn(encoded, SNR), mode=2)
                     else:
-                        val_dec,_ = model(vx)  ## shape = (256, 256, 4, 172)
+                        val_dec, _, _ = model(vx)  ## shape = (256, 256, 4, 172)
     
                     
                     ## Recovery to image HSI

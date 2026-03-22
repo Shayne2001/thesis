@@ -1,0 +1,42 @@
+digraph SSANet_Task2 {
+  rankdir=LR;
+  splines=true;
+  node [shape=box, style="rounded,filled", fillcolor="#F8FAFC", color="#334155", fontname="Arial"];
+  edge [color="#475569", arrowsize=0.8];
+
+  X [label="输入 X\n[B, C(可变), 128, 4]"];
+  Xb [label="X_base\n[B, bands(固定), 128, 4]"];
+  XH_base [label="\u005E X_base\n[B, bands(固定), 128, 4]"];
+  XH [label="输出 \u005E X\n[B, C(可变), 128, 4]"];
+
+  subgraph cluster_mapper {
+    label="BandMapper (可变波段适配)";
+    color="#CBD5E1";
+    style="rounded";
+
+    m1 [label="Band Embedding\n(sinusoidal channel index)"];
+    m2 [label="Cross-attn weights\nQ (learnable) x E"];
+    m3 [label="Map: C -> bands\n(matmul over band dim)"];
+    m4 [label="Map back: bands -> C\n(matmul over band dim)"];
+
+    m1 -> m2;
+    m2 -> m3;
+    m2 -> m4;
+  }
+
+  subgraph cluster_core {
+    label="SSANet core (Task1: CTM/MMF 已替换)";
+    color="#CBD5E1";
+    style="rounded";
+
+    core [label="Encoder + (optional AWGN) + Decoder\n(内部 bands 固定)"];
+  }
+
+  X -> m1;
+  X -> m3;
+  m3 -> Xb;
+  Xb -> core;
+  core -> XH_base;
+  XH_base -> m4;
+  m4 -> XH;
+}

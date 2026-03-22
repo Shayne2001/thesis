@@ -1,0 +1,53 @@
+digraph SSANet_Task1 {
+  rankdir=LR;
+  splines=true;
+  node [shape=box, style="rounded,filled", fillcolor="#F8FAFC", color="#334155", fontname="Arial"];
+  edge [color="#475569", arrowsize=0.8];
+
+  X [label="输入 X\n[B, bands, 128, 4]"];
+  Y [label="压缩表征 Y\n[B, last_ch, 32/64, 1/2]"];
+  XH [label="重建 \u005E X\n[B, bands, 128, 4]"];
+
+  subgraph cluster_encoder {
+    label="LEncoder (Encoder)";
+    color="#CBD5E1";
+    style="rounded";
+
+    e1 [label="Conv 3x2\nstride 2"];
+    e2 [label="CTM/MMF-1\n(split: CNN + SpectralT)"];
+    e3 [label="Conv 3x1"];
+    e4 [label="CTM/MMF-2\n(split: CNN + SpectralT)"];
+    e5 [label="Conv 3xk\n(compress to last_ch)"];
+    e6 [label="CTM/MMF-3\n(split: CNN + SpectralT)"];
+
+    e1 -> e2 -> e3 -> e4 -> e5 -> e6;
+  }
+
+  subgraph cluster_channel {
+    label="Channel (optional)";
+    color="#CBD5E1";
+    style="rounded";
+    awgn [label="AWGN (optional)"];
+  }
+
+  subgraph cluster_decoder {
+    label="SSDecoder (Decoder)";
+    color="#CBD5E1";
+    style="rounded";
+
+    d1 [label="Conv_first\n(in_nc->64)"];
+    d2 [label="SSFE trunk x16\n[MRDFx3 + CTM/MMF]\n+ gate"];
+    d3 [label="Trunk conv + gate"];
+    d4 [label="Upsample x2\n(nearest + conv)"];
+    d5 [label="Upsample x2 (if cr<5)"];
+    d6 [label="HRconv + Conv_last\n(-> bands)"];
+
+    d1 -> d2 -> d3 -> d4 -> d5 -> d6;
+  }
+
+  X -> e1;
+  e6 -> Y;
+  Y -> awgn;
+  awgn -> d1;
+  d6 -> XH;
+}
