@@ -65,6 +65,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sigma', type=float, default=0.0)
     parser.add_argument('--prefix', default='SSANet')
 
+    # 可变波段训练（BandMapper 训练时随机丢弃 bands）
+    parser.add_argument('--var_bands', action='store_true', help='Enable variable-band training by randomly dropping input bands')
+    parser.add_argument('--var_bands_min_missing', type=float, default=0.0, help='Min missing ratio in [0,1)')
+    parser.add_argument('--var_bands_max_missing', type=float, default=0.5, help='Max missing ratio in [0,1)')
+    parser.add_argument('--var_bands_warmup_epochs', type=int, default=0, help='Linearly ramp max_missing during first N epochs')
+    parser.add_argument('--var_bands_val_missing', type=float, default=None, help='If set, apply fixed missing ratio during validation')
+
     return parser.parse_args()
 
 
@@ -90,6 +97,15 @@ VAL_LIST = config.get('val_list', args.val_list)
 NUM_WORKERS = int(config.get('num_workers', args.num_workers))
 MARGINAL = int(config.get('marginal', args.marginal))
 
+VAR_BANDS = bool(config.get('var_bands', args.var_bands))
+VAR_BANDS_MIN_MISSING = float(config.get('var_bands_min_missing', args.var_bands_min_missing))
+VAR_BANDS_MAX_MISSING = float(config.get('var_bands_max_missing', args.var_bands_max_missing))
+VAR_BANDS_WARMUP_EPOCHS = int(config.get('var_bands_warmup_epochs', args.var_bands_warmup_epochs))
+VAR_BANDS_VAL_MISSING = config.get('var_bands_val_missing', args.var_bands_val_missing)
+if VAR_BANDS_VAL_MISSING is not None:
+    VAR_BANDS_VAL_MISSING = float(VAR_BANDS_VAL_MISSING)
+
+
 
 # def model_metrics(model, input_shape = (172, 128, 4)):
 #     # 参数量
@@ -106,6 +122,23 @@ MARGINAL = int(config.get('marginal', args.marginal))
 #     print(f"可训练参数: {trainable_params} ({trainable_params/1e6:.2f}M)")
 #     print(f"FLOPs: {flops/1e9:.2f} GFLOPs")
 #     print(f"最大显存占用: {mem_alloc:.2f} GB")
+
+def _sample_band_indices(total_bands: int, min_missing: float, max_missing: float, epoch: int) -> torch.Tensor:
+    if max_missing <= 0:
+        return torch.arange(total_bands, dtype=torch.long)
+
+    effective_max = max_missing
+    if VAR_BANDS_WARMUP_EPOCHS and VAR_BANDS_WARMUP_EPOCHS > 0:
+        progress = min(1.0, float(epoch + 1) / float(VAR_BANDS_WARMUP_EPOCHS))
+        effective_max = max_missing * progress
+
+    missing = rn.uniform(min_missing, effective_max)
+    keep = max(1, int(round(total_bands * (1.0 - missing))))
+
+    idx = torch.randperm(total_bands, dtype=torch.long)[:keep]
+    idx, _ = torch.sort(idx)
+    return idx
+
 
 def trainer():
     ## Reading files #
@@ -176,7 +209,14 @@ def trainer():
             ## x.view改变张量的形状  这里将第一个维度大小和第二个维度合并,其余维度保持不变
             x = x.to(device).permute(0,3,1,2).float() ## 重新排列张量的维度  x.shape = (240, 172, 128, 4)
             # print("x: ", x.shape)
-            decoded, _, _ = model(x)      ## 执行模型，返回解码后的结果
+            band_ids = None
+            if VAR_BANDS:
+                idx = _sample_band_indices(BANDS, VAR_BANDS_MIN_MISSING, VAR_BANDS_MAX_MISSING, epoch)
+                idx = idx.to(device)
+                x = x.index_select(1, idx)
+                band_ids = idx
+
+            decoded, _, _ = model(x, band_ids=band_ids)      ## 执行模型，返回解码后的结果
             # gates = [model.gate1.scores, model.gete2.scores]
             loss = L1Loss(decoded, x)  ## 计算L1Loss
             loss.backward()            ## 反向传播
@@ -198,17 +238,31 @@ def trainer():
                     vx = vx.view(vx.size()[0]*vx.size()[1], vx.size()[2], vx.size()[3], vx.size()[4])
                     ## vx.shape = torch.Size([256, 172, 256, 4])
                     vx= vx.to(device).permute(0,3,1,2).float()
+                    val_band_idx = None
+                    band_ids = None
+                    if VAR_BANDS_VAL_MISSING is not None:
+                        idx = _sample_band_indices(BANDS, VAR_BANDS_VAL_MISSING, VAR_BANDS_VAL_MISSING, epoch)
+                        val_band_idx = idx.cpu().numpy()
+                        idx = idx.to(device)
+                        vx = vx.index_select(1, idx)
+                        band_ids = idx
+
                     if SIGMA > 0:
-                        encoded, _ = model(vx, mode=1)
-                        val_dec = model(awgn(encoded, SNR), mode=2)
+                        encoded, _ = model(vx, mode=1, band_ids=band_ids)
+                        base_out = model(awgn(encoded, SNR), mode=2)
+                        if band_ids is not None:
+                            # mode=2 不会做 band 映射，这里手动从 base_bands 映射回输入 bands
+                            base_out = model.module.band_mapper.from_base(base_out, band_ids=band_ids, out_bands=vx.shape[1])
+                        val_dec = base_out
                     else:
-                        val_dec, _, _ = model(vx)  ## shape = (256, 256, 4, 172)
+                        val_dec, _, _ = model(vx, band_ids=band_ids)  ## shape = (256, 256, 4, bands)
     
                     
                     ## Recovery to image HSI
                     val_batch_size = len(vfn)
                     ## 
-                    img = [np.zeros((VAL_HR, VAL_HR, BANDS)) for _ in range(val_batch_size)]
+                    out_bands = vx.shape[1]
+                    img = [np.zeros((VAL_HR, VAL_HR, out_bands)) for _ in range(val_batch_size)]
                     val_dec = val_dec.permute(0,2,3,1).cpu().numpy()
                     cnt = 0
                     
@@ -224,6 +278,8 @@ def trainer():
                         
                         ## lmat 函数用于加载真实的高分辨率图像，并将其转换为 float64 类型
                         GT = lmat(vfn[bt]).astype(np.float64)
+                        if val_band_idx is not None:
+                            GT = GT[:, :, val_band_idx]
                         ## 去除 GT 中的零值
                         for i in range(GT.shape[0]):
                             for j in range(GT.shape[1]):
